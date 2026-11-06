@@ -52,6 +52,9 @@ def build_dataloaders(
     If a pre-fitted scaler is provided, it is reused.
     Otherwise, a new MinMaxScaler is fitted on training ages.
 
+    If train_ratio, valid_ratio, and test_ratio are all None, the entire
+    dataset is returned as a single unmasked DataLoader under 'loader'.
+
     Parameters
     ----------
     data : dict
@@ -62,7 +65,7 @@ def build_dataloaders(
     clock_age    : Name of the clock which is to be trained on e.g. chron, hannum, horvath
     train_ratio,
     valid_ratio,
-    test_ratio   : float — must sum to 1.0
+    test_ratio   : float — must sum to 1.0, or all None to skip splitting
     mask_ratio   : float — upper bound on random masking applied to train split
     batch_size   : int
     num_workers  : int — 0 for Windows/macOS; ≥1 recommended on Linux cluster
@@ -73,14 +76,25 @@ def build_dataloaders(
     Returns
     -------
     dict
-        train_loader, valid_loader, test_loader : DataLoader
-        train_df, valid_df, test_df             : DataFrame
-        scaler                                  : MinMaxScaler fit on train ages
-        n_present_cpgs, n_missing_cpgs          : int
+        If splits provided:
+            train_loader, valid_loader, test_loader : DataLoader
+            train_df, valid_df, test_df             : DataFrame
+            scaler                                  : MinMaxScaler fit on train ages
+            n_present_cpgs, n_missing_cpgs          : int
+        If no splits (all ratios None):
+            loader                                  : DataLoader
+            df                                      : DataFrame
+            scaler                                  : MinMaxScaler fit on all ages
+            n_present_cpgs, n_missing_cpgs          : int
     """
 
-    assert abs(train_ratio + valid_ratio + test_ratio - 1.0) < 1e-6, \
-        "train_ratio + valid_ratio + test_ratio must sum to 1.0"
+    split_mode = not (train_ratio is None and valid_ratio is None and test_ratio is None)
+
+    if split_mode:
+        assert None not in (train_ratio, valid_ratio, test_ratio), \
+            "Either all ratios must be None, or all must be provided."
+        assert abs(train_ratio + valid_ratio + test_ratio - 1.0) < 1e-6, \
+            "train_ratio + valid_ratio + test_ratio must sum to 1.0"
 
     # ── 1. Align meta and CpG on sample ID ──────────────────────────────────
     meta = data["meta"].set_index("ID").copy()
@@ -142,7 +156,38 @@ def build_dataloaders(
         index=meta.index,
     )
 
-    # ── 5. Train / valid / test split ────────────────────────────────────────
+    # ── 5. No-split mode: return a single DataLoader ─────────────────────────
+    if not split_mode:
+        if scaler is None:
+            scaler = preprocessing.MinMaxScaler(feature_range=(0, 1))
+            scaler.fit(combined_df[clock_age].to_numpy().reshape(-1, 1))
+            if verbose:
+                print("ℹ  Scaler fitted on all ages (no-split mode).")
+        else:
+            if verbose:
+                print("ℹ  Reusing supplied pre-fitted scaler.")
+
+        dataset = AgeDataset(vocab, combined_df, scaler, clock_age, mask_ratio=0.0)
+        loader  = DataLoader(
+            dataset,
+            batch_size  = batch_size,
+            collate_fn  = dataset.collater,
+            shuffle     = False,
+            num_workers = num_workers,
+        )
+
+        if verbose:
+            print(f"✓ Single loader built ({len(combined_df)} samples, no masking).\n")
+
+        return {
+            "loader"         : loader,
+            "df"             : combined_df,
+            "scaler"         : scaler,
+            "n_present_cpgs" : len(present_cpgs),
+            "n_missing_cpgs" : len(missing_cpgs),
+        }
+
+    # ── 6. Train / valid / test split ────────────────────────────────────────
     train_df, temp_df = train_test_split(
         combined_df,
         test_size    = round(1.0 - train_ratio, 10),
@@ -162,7 +207,7 @@ def build_dataloaders(
         print(f"Age range (train) : "
               f"{train_df[clock_age].min():.1f} – {train_df[clock_age].max():.1f} years")
 
-    # ── 6. Fit or reuse scaler ───────────────────────────────────────────────
+    # ── 7. Fit or reuse scaler ───────────────────────────────────────────────
     if scaler is None:
         scaler = preprocessing.MinMaxScaler(feature_range=(0, 1))
         scaler.fit(train_df[clock_age].to_numpy().reshape(-1, 1))
@@ -173,12 +218,12 @@ def build_dataloaders(
         if verbose:
             print("ℹ  Reusing supplied pre-fitted scaler.")
 
-    # ── 7. Build AgeDataset for each split ──────────────────────────────────
+    # ── 8. Build AgeDataset for each split ──────────────────────────────────
     train_dataset = AgeDataset(vocab, train_df, scaler, clock_age, mask_ratio=mask_ratio)
     valid_dataset = AgeDataset(vocab, valid_df, scaler, clock_age, mask_ratio=0.0)
-    test_dataset  = AgeDataset(vocab, test_df, scaler, clock_age, mask_ratio=0.0)
+    test_dataset  = AgeDataset(vocab, test_df,  scaler, clock_age, mask_ratio=0.0)
 
-    # ── 8. Build DataLoaders ─────────────────────────────────────────────────
+    # ── 9. Build DataLoaders ─────────────────────────────────────────────────
     train_loader = DataLoader(
         train_dataset,
         batch_size  = batch_size,
