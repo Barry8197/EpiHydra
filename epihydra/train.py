@@ -127,7 +127,7 @@ def build_dataloaders(
         vocab.vocab.lookup_token(int(i)) for i in vocab.CpG_ids
     ]
 
-    data_cpgs    = set(cpg.index)
+    data_cpgs = set(cpg.dropna(how="all").index)
     present_cpgs = [c for c in vocab_cpg_order if c in data_cpgs]
     missing_cpgs = [c for c in vocab_cpg_order if c not in data_cpgs]
 
@@ -287,6 +287,9 @@ def build_multiclock_dataloaders(
     and surfaced via a validity mask so the training loop can exclude that
     clock's loss term for that sample.
 
+    If train_ratio, valid_ratio, and test_ratio are all None, the entire
+    dataset is returned as a single unmasked DataLoader under 'loader'.
+
     Parameters
     ----------
     data        : dict — 'meta' (DataFrame with 'ID' + one column per clock),
@@ -303,13 +306,28 @@ def build_multiclock_dataloaders(
 
     Returns
     -------
-    dict with train_loader, valid_loader, test_loader, train_df, valid_df,
-    test_df, scalers (dict[str, MinMaxScaler] — the scalers actually used,
-    supplied or newly fitted), n_present_cpgs,
-    n_missing_cpgs, n_present_per_clock (dict[str, int])
+    dict
+        If splits provided:
+            train_loader, valid_loader, test_loader : DataLoader
+            train_df, valid_df, test_df             : DataFrame
+            scalers                                 : dict[str, MinMaxScaler]
+            n_present_cpgs, n_missing_cpgs          : int
+            n_present_per_clock                     : dict[str, int]
+        If no splits (all ratios None):
+            loader                                  : DataLoader
+            df                                      : DataFrame
+            scalers                                 : dict[str, MinMaxScaler]
+            n_present_cpgs, n_missing_cpgs          : int
+            n_present_per_clock                     : dict[str, int]
     """
-    assert abs(train_ratio + valid_ratio + test_ratio - 1.0) < 1e-6, \
-        "train_ratio + valid_ratio + test_ratio must sum to 1.0"
+    split_mode = not (train_ratio is None and valid_ratio is None and test_ratio is None)
+
+    if split_mode:
+        assert None not in (train_ratio, valid_ratio, test_ratio), \
+            "Either all ratios must be None, or all must be provided."
+        assert abs(train_ratio + valid_ratio + test_ratio - 1.0) < 1e-6, \
+            "train_ratio + valid_ratio + test_ratio must sum to 1.0"
+
     assert len(clock_names) >= 1, "clock_names must be non-empty"
 
     # ── 1. Align meta and CpG on sample ID ──────────────────────────────────
@@ -348,7 +366,7 @@ def build_multiclock_dataloaders(
     vocab_cpg_order = [
         vocab.vocab.lookup_token(int(i)) for i in vocab.CpG_ids
     ]
-    data_cpgs    = set(cpg.index)
+    data_cpgs    = set(cpg.dropna().index)
     present_cpgs = [c for c in vocab_cpg_order if c     in data_cpgs]
     missing_cpgs = [c for c in vocab_cpg_order if c not in data_cpgs]
 
@@ -372,7 +390,52 @@ def build_multiclock_dataloaders(
     combined_dict["data"] = list(cpg_aligned.values)
     combined_df = pd.DataFrame(combined_dict, index=meta.index)
 
-    # ── 5. Train / valid / test split ────────────────────────────────────────
+    n_present_per_clock = {n: int(meta[n].notna().sum()) for n in clock_names}
+
+    # ── 5. No-split mode: return a single DataLoader ─────────────────────────
+    if not split_mode:
+        supplied = dict(scalers) if scalers is not None else {}
+        scalers  = {}
+        for name in clock_names:
+            if name in supplied:
+                scalers[name] = supplied[name]
+                if verbose:
+                    print(f"ℹ  {name:<20}: reusing supplied pre-fitted scaler.")
+                continue
+
+            vals = combined_df[name].dropna().to_numpy().reshape(-1, 1)
+            scaler = preprocessing.MinMaxScaler(feature_range=(0, 1))
+            if len(vals) >= 2:
+                scaler.fit(vals)
+            else:
+                print(f"⚠  Clock '{name}' has <2 labeled samples — its head will not learn anything meaningful.")
+                scaler.fit(np.array([[0.0], [1.0]]))
+            scalers[name] = scaler
+            if verbose:
+                print(f"ℹ  {name:<20}: scaler fitted on all values (no-split mode).")
+
+        dataset = MultiClockDataset(vocab, combined_df, scalers, clock_names, mask_ratio=0.0)
+        loader  = DataLoader(
+            dataset,
+            batch_size  = batch_size,
+            collate_fn  = dataset.collater,
+            shuffle     = False,
+            num_workers = num_workers,
+        )
+
+        if verbose:
+            print(f"✓ Single multi-clock loader built ({len(combined_df)} samples, no masking).\n")
+
+        return {
+            "loader"              : loader,
+            "df"                  : combined_df,
+            "scalers"             : scalers,
+            "n_present_cpgs"      : len(present_cpgs),
+            "n_missing_cpgs"      : len(missing_cpgs),
+            "n_present_per_clock" : n_present_per_clock,
+        }
+
+    # ── 6. Train / valid / test split ────────────────────────────────────────
     train_df, temp_df = train_test_split(
         combined_df,
         test_size    = round(1.0 - train_ratio, 10),
@@ -388,9 +451,7 @@ def build_multiclock_dataloaders(
     if verbose:
         print(f"\nTrain : {len(train_df)} | Valid : {len(valid_df)} | Test : {len(test_df)}")
 
-    # ── 6. Fit or reuse one scaler per clock ─────────────────────────────────
-    # Supplied scalers are reused as-is; any clock without one gets a new
-    # scaler fitted on that clock's non-NaN train values.
+    # ── 7. Fit or reuse one scaler per clock ─────────────────────────────────
     supplied = dict(scalers) if scalers is not None else {}
     scalers  = {}
     for name in clock_names:
@@ -405,9 +466,6 @@ def build_multiclock_dataloaders(
         if len(vals) >= 2:
             scaler.fit(vals)
         else:
-            # Degenerate case: fewer than 2 labeled train samples for this
-            # clock. Fit on [0, 1] so transform doesn't crash; this clock's
-            # head will just have near-nothing to learn from — worth a warning.
             print(f"⚠  Clock '{name}' has <2 labeled samples in the train "
                   f"split — its head will not learn anything meaningful.")
             scaler.fit(np.array([[0.0], [1.0]]))
@@ -415,7 +473,7 @@ def build_multiclock_dataloaders(
         if verbose:
             print(f"ℹ  {name:<20}: scaler fitted on training values.")
 
-    # ── 7. Build MultiClockDataset for each split ────────────────────────────
+    # ── 8. Build MultiClockDataset for each split ────────────────────────────
     train_dataset = MultiClockDataset(vocab, train_df, scalers, clock_names, mask_ratio=mask_ratio)
     valid_dataset = MultiClockDataset(vocab, valid_df, scalers, clock_names, mask_ratio=0.0)
     test_dataset  = MultiClockDataset(vocab, test_df,  scalers, clock_names, mask_ratio=0.0)
@@ -446,9 +504,9 @@ def build_multiclock_dataloaders(
         "scalers"             : scalers,
         "n_present_cpgs"      : len(present_cpgs),
         "n_missing_cpgs"      : len(missing_cpgs),
-        "n_present_per_clock" : {n: int(meta[n].notna().sum()) for n in clock_names},
+        "n_present_per_clock" : n_present_per_clock,
     }
-
+    
 
 def train_one_epoch_multiclock(model, loader, optimizer, scaler_amp, device, clock_names):
     """
@@ -594,14 +652,15 @@ def evaluate(model, loader, scaler, device):
 
     Returns
     -------
-    mae    : float
-    preds  : np.ndarray — predicted ages in years
-    labels : np.ndarray — true ages in years
+    mae        : float
+    preds      : np.ndarray — predicted ages in years
+    labels     : np.ndarray — true ages in years
+    sample_ids : list       — patient/sample IDs
     """
     model.eval()
-    preds, labels = [], []
+    preds, labels, sample_ids = [], [], []
 
-    for gene_ids, _, target_vals, ages, _ in loader:
+    for gene_ids, _, target_vals, ages, _, ids in loader:
         gene_ids    = gene_ids.to(device)
         target_vals = target_vals.to(device)
 
@@ -613,7 +672,8 @@ def evaluate(model, loader, scaler, device):
         ).flatten()
         preds.extend(pred_age)
         labels.extend(ages.numpy())
+        sample_ids.extend(ids)
 
     preds  = np.array(preds)
     labels = np.array(labels)
-    return float(np.mean(np.abs(preds - labels))), preds, labels
+    return float(np.mean(np.abs(preds - labels))), preds, labels, sample_ids

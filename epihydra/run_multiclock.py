@@ -63,8 +63,10 @@ from scipy.stats import pearsonr
 from methylgpt import MethylGPTModel, MethylVocab
 from scgpt.model.model import TransformerModel
 
-from epihydra import VocabWrapper, MultiClockPredictor, load_backbone
-from train import (
+from epihydra import ( 
+    VocabWrapper, 
+    MultiClockPredictor, 
+    load_backbone,
     build_multiclock_dataloaders,
     train_one_epoch_multiclock,
     evaluate_multiclock,

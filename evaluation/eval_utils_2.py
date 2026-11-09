@@ -24,16 +24,10 @@ from peft import LoraConfig, get_peft_model
 from scipy.stats import pearsonr
 from sklearn.metrics import r2_score
 
-# Make the EpiHydra source importable (sibling folder of this file's folder)
-EPIHYDRA_SRC = (Path(__file__).resolve().parent / ".." / "04_epihydra").resolve()
-if str(EPIHYDRA_SRC) not in sys.path:
-    sys.path.insert(0, str(EPIHYDRA_SRC))
-
 from epihydra import AgePredictor, load_backbone  # noqa: E402
 
 # Name of the default clock, whose head lives inside best_model.pt itself
 DEFAULT_CLOCK = "age"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scalers
@@ -74,37 +68,127 @@ def find_backbone_checkpoint(model_path):
         )
     return candidates[0]
 
+def _build_backbone(model_path, vocab, pretrain_config, device, lora_config=None):
+    """
+    Shared backbone builder: load pretrained weights and optionally wrap with LoRA.
+
+    Parameters
+    ----------
+    lora_config : LoraConfig or None — if None, backbone is returned as-is (frozen,
+                  no LoRA). If provided, backbone is wrapped with get_peft_model
+                  ready for training.
+    """
+    backbone = load_backbone(find_backbone_checkpoint(model_path), vocab, pretrain_config)
+
+    if lora_config is not None:
+        backbone = get_peft_model(backbone, lora_config)
+        backbone.print_trainable_parameters()
+
+    return backbone.to(device)
+
 
 def build_age_model(model_path, vocab, pretrain_config, device,
                     num_heads=4, dropout=0.1, lora_config=None):
     """
-    Build the AgePredictor (MethylGPT backbone + regression head) and wrap the
-    backbone with LoRA, so its parameter names match the EpiHydra checkpoint.
+    Build an AgePredictor ready for training.
 
-    The LoRA settings must match those used at training time, otherwise the
-    state dict will not load.
+    Backbone is wrapped with LoRA (default r=16, alpha=8) unless a custom
+    lora_config is supplied. No weights are loaded into the head.
+
+    Parameters
+    ----------
+    model_path      : str | Path — directory containing the backbone checkpoint
+    vocab           : VocabWrapper
+    pretrain_config : dict
+    device          : torch.device
+    num_heads       : int
+    dropout         : float
+    lora_config     : LoraConfig or None — defaults to r=16, alpha=8
     """
-    backbone = load_backbone(find_backbone_checkpoint(model_path), vocab, pretrain_config)
+    if lora_config is None:
+        lora_config = LoraConfig(
+            r             = 16,
+            lora_alpha    = 8,
+            target_modules= ["Wqkv", "out_proj", "linear1", "linear2"],
+            lora_dropout  = 0.1,
+        )
+
+    backbone = _build_backbone(model_path, vocab, pretrain_config, device, lora_config)
 
     model = AgePredictor(
         backbone,
-        embed_dim=pretrain_config["layer_size"],
-        pad_id=vocab.vocab["<pad>"],
-        num_heads=num_heads,
-        dropout=dropout,
+        embed_dim = pretrain_config["layer_size"],
+        pad_id    = vocab.vocab["<pad>"],
+        num_heads = num_heads,
+        dropout   = dropout,
     ).to(device)
 
-    if lora_config is None:
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=8,
-            target_modules=["Wqkv", "out_proj", "linear1", "linear2"],
-            lora_dropout=0.1,
-        )
-    model.backbone = get_peft_model(model.backbone, lora_config)
-    model.backbone.print_trainable_parameters()
     return model
 
+
+def build_multiclock_model(model_path, vocab, pretrain_config, lora_ckpt, head_path,
+                           clock_names, device, num_heads=4, dropout=0.1,
+                           lora_r=16, lora_alpha=8):
+    """
+    Build a MultiClockPredictor with a frozen, LoRA-merged backbone and one
+    trained head per clock.
+
+    Unlike build_age_model, this loads a trained checkpoint — backbone weights
+    are merged and frozen, and each clock head is loaded from disk.
+
+    Parameters
+    ----------
+    model_path      : str | Path — directory containing the backbone checkpoint
+    vocab           : VocabWrapper
+    pretrain_config : dict
+    lora_ckpt       : str | Path — directory containing LoRA adapter weights
+                      and head checkpoints (best_head_<name>.pt)
+    head_path       : str | Path — fallback path if heads not in lora_ckpt
+    clock_names     : list[str]
+    device          : torch.device
+    num_heads       : int
+    dropout         : float
+    lora_r          : int   — must match training config
+    lora_alpha      : int   — must match training config
+    """
+    from epihydra import MultiClockPredictor
+    from run_multiclock import load_lora_adapters
+
+    lora_ckpt = Path(lora_ckpt)
+
+    # ── Backbone: load, merge LoRA, freeze ──────────────────────────────────
+    backbone = _build_backbone(model_path, vocab, pretrain_config, device)
+    backbone, lora_info = load_lora_adapters(
+        backbone, lora_ckpt, device, lora_r=lora_r, lora_alpha=lora_alpha, merge=True,
+    )
+    for p in backbone.parameters():
+        p.requires_grad_(False)
+    backbone.eval()
+
+    # ── Model ────────────────────────────────────────────────────────────────
+    model = MultiClockPredictor(
+        backbone,
+        embed_dim   = pretrain_config["layer_size"],
+        pad_id      = vocab.vocab["<pad>"],
+        clock_names = clock_names,
+        num_heads   = num_heads,
+        dropout     = dropout,
+    ).to(device)
+
+    # ── Heads ────────────────────────────────────────────────────────────────
+    for name in clock_names:
+        head_state, meta = load_head_weights(name, lora_ckpt, head_path)
+        model.heads[name].load_state_dict(head_state)
+
+        trained_on = ((meta or {}).get("lora") or {}).get("ckpt")
+        if trained_on and Path(trained_on).resolve() != lora_ckpt.resolve():
+            print(f"  ⚠  head '{name}' was trained on backbone {trained_on}, "
+                  f"not {lora_ckpt}")
+        src = lora_ckpt.name if meta is None else f"best_head_{name}.pt (epoch {meta.get('epoch')})"
+        print(f"  loaded head {name:<20} <- {src}")
+
+    model.eval()
+    return model
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Checkpoint loading
@@ -137,7 +221,7 @@ def load_clock_state(ckpt_path, head_path, clock=DEFAULT_CLOCK, device="cpu"):
 # ─────────────────────────────────────────────────────────────────────────────
 # Metrics & plotting
 # ─────────────────────────────────────────────────────────────────────────────
-def eval_metrics(labels, preds, mae, split="test", verbose=True):
+def eval_metrics(labels, preds, mae, verbose=True):
     """
     Compute R² and Pearson r for a set of predictions and (optionally) print
     them alongside the MAE.
@@ -154,16 +238,15 @@ def eval_metrics(labels, preds, mae, split="test", verbose=True):
     }
 
     if verbose:
-        name = split.capitalize()
         print(f"\n{'─' * 40}")
-        print(f"  {name} MAE      : {metrics['mae']:.2f} years")
-        print(f"  {name} R²       : {metrics['r2']:.3f}")
-        print(f"  {name} Pearson r: {metrics['pearson_r']:.3f}")
+        print(f"   MAE      : {metrics['mae']:.2f} years")
+        print(f"   R²       : {metrics['r2']:.3f}")
+        print(f"   Pearson r: {metrics['pearson_r']:.3f}")
         print(f"{'─' * 40}\n")
     return metrics
 
 
-def plot_predictions(labels, preds, metrics, clock=DEFAULT_CLOCK, split="test", ax=None):
+def plot_predictions(labels, preds, metrics, clock=DEFAULT_CLOCK, ax=None):
     """Scatter of predicted vs. target age with a y = x reference line."""
     labels, preds = np.asarray(labels), np.asarray(preds)
     if ax is None:
@@ -179,7 +262,7 @@ def plot_predictions(labels, preds, metrics, clock=DEFAULT_CLOCK, split="test", 
     target = "Chronological age" if clock == DEFAULT_CLOCK else f"Target {clock}"
     ax.set_xlabel(f"{target} (years)")
     ax.set_ylabel("Predicted age (years)")
-    ax.set_title(f"{clock} | {split} | MAE={metrics['mae']:.1f} yrs | "
+    ax.set_title(f"{clock} | MAE={metrics['mae']:.1f} yrs | "
                  f"r={metrics['pearson_r']:.3f}")
     ax.legend(frameon=False)
     ax.figure.tight_layout()
@@ -235,57 +318,6 @@ def load_head_weights(clock, lora_ckpt, head_path):
         raise FileNotFoundError(f"No head checkpoint for clock '{clock}' at {head_file}")
     ckpt = torch.load(head_file, map_location="cpu")
     return ckpt["head_state"], ckpt
-
-
-def build_multiclock_model(model_path, vocab, pretrain_config, lora_ckpt, head_path,
-                           clock_names, device, num_heads=4, dropout=0.1,
-                           lora_r=16, lora_alpha=8):
-    """
-    Build a MultiClockPredictor with a frozen, LoRA-merged backbone and one
-    trained head per clock (including 'age').
-
-    `lora_r` / `lora_alpha` must match the LoRA config used to train
-    best_model.pt (16 / 8 — the values that loaded cleanly in notebook 01).
-    """
-    # Imported here so notebook 01 doesn't need run_multiclock's dependencies
-    from epihydra import MultiClockPredictor
-    from run_multiclock import load_lora_adapters
-
-    lora_ckpt = Path(lora_ckpt)
-
-    # ── Backbone: pretrained MethylGPT + merged LoRA adapters, frozen ──
-    backbone = load_backbone(find_backbone_checkpoint(model_path), vocab, pretrain_config)
-    backbone, lora_info = load_lora_adapters(
-        backbone, lora_ckpt, device, lora_r=lora_r, lora_alpha=lora_alpha, merge=True,
-    )
-    for p in backbone.parameters():
-        p.requires_grad_(False)
-    backbone.eval()
-
-    model = MultiClockPredictor(
-        backbone,
-        embed_dim   = pretrain_config["layer_size"],
-        pad_id      = vocab.vocab["<pad>"],
-        clock_names = clock_names,
-        num_heads   = num_heads,
-        dropout     = dropout,
-    ).to(device)
-
-    # ── Heads ──
-    for name in clock_names:
-        head_state, meta = load_head_weights(name, lora_ckpt, head_path)
-        model.heads[name].load_state_dict(head_state)  # strict: shapes must match
-
-        # Warn if this head was trained on a different LoRA backbone
-        trained_on = ((meta or {}).get("lora") or {}).get("ckpt")
-        if trained_on and Path(trained_on).resolve() != lora_ckpt.resolve():
-            print(f"  ⚠  head '{name}' was trained on backbone {trained_on}, "
-                  f"not {lora_ckpt}")
-        src = lora_ckpt.name if meta is None else f"best_head_{name}.pt (epoch {meta.get('epoch')})"
-        print(f"  loaded head {name:<20} <- {src}")
-
-    model.eval()
-    return model
 
 def load_saved_scalers(head_path, scaler_file="scalers.pkl"):
     """

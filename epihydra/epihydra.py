@@ -82,15 +82,21 @@ class AgeDataset(torch.utils.data.Dataset):
         self.ages_norm = torch.tensor(
             scaler.transform(self.ages.reshape(-1, 1)), dtype=torch.float
         )
+        self.sample_ids = df.index.tolist() 
     
     def __getitem__(self, index):
-        return self.gene_datas[index], torch.tensor(self.ages[index]).float(), self.ages_norm[index]
+        return (
+            self.gene_datas[index],
+            torch.tensor(self.ages[index]).float(),
+            self.ages_norm[index],
+            self.sample_ids[index],          
+        )
     
     def __len__(self):
         return len(self.ages)
     
     def collater(self, batch):
-        gene_datas, ages, ages_norm = zip(*batch)
+        gene_datas, ages, ages_norm, sample_ids = zip(*batch)
         
         # Process each sample individually with its own random mask
         all_gene_ids, all_masked, all_targets = [], [], []
@@ -105,7 +111,8 @@ class AgeDataset(torch.utils.data.Dataset):
             torch.cat(all_masked),
             torch.cat(all_targets),
             torch.stack(ages),
-            torch.stack(ages_norm)
+            torch.stack(ages_norm),
+            sample_ids,
         )
 
     def _tokenize(self, data):
