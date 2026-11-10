@@ -36,10 +36,12 @@ from torch.utils.data import DataLoader
 
 from epihydra import AgePredictor, MultiClockPredictor, load_backbone
 
-DEFAULT_CLOCK = "age"            # clock whose head lives inside best_model.pt
+DEFAULT_CLOCK = "age"
 CKPT_NAME     = "best_model.pt"
 SCALER_FILE   = "scalers.pkl"
 LORA_TARGETS  = ["Wqkv", "out_proj", "linear1", "linear2"]
+PAD_VALUE     = -2.0   # missing CpG / padding value used in tokenisation
+MASK_VALUE    = -1.0   # mask token value used in training
 
 METRICS       = ("mae", "pearson_r", "r2")
 _HIGH_IS_GOOD = {"mae": False, "pearson_r": True, "r2": True}
@@ -253,28 +255,41 @@ def ordered_loader(loader, batch_size=None):
                       shuffle=False, collate_fn=ds.collater, num_workers=0)
 
 
-def _mask_observed(gene_ids, values, frac, pad_id, pad_value=-2.0, mask_value=-1.0):
+def _apply_masking(gene_ids, values, pad_id, frac=0.0, remove_ids=None):
     """
-    Replace `frac` of each sample's OBSERVED CpG values with `mask_value`.
-    Padding tokens and already-missing CpGs (value == pad_value) are never chosen.
+    Hide observed CpGs from the model by setting them to MASK_VALUE.
+
+    remove_ids : token IDs blanked in EVERY sample (assay-level failure)
+    frac       : random fraction of each sample's remaining observed CpGs
+
+    Padding, the CLS token and already-missing CpGs are never touched.
     """
-    if frac <= 0:
+    if frac <= 0 and remove_ids is None:
         return values
 
-    masked   = values.clone()
-    observed = gene_ids.ne(pad_id) & values.ne(pad_value)
-    for i in range(gene_ids.shape[0]):
-        idx = observed[i].nonzero(as_tuple=True)[0]
-        if len(idx) == 0:
-            continue
-        n_mask = max(1, int(len(idx) * frac))
-        masked[i, idx[torch.randperm(len(idx), device=idx.device)[:n_mask]]] = mask_value
-    return masked
+    values   = values.clone()
+    observed = gene_ids.ne(pad_id) & values.ne(PAD_VALUE)
+    observed[:, 0] = False                                  # CLS token
+
+    if remove_ids is not None:
+        hit = observed & torch.isin(gene_ids, remove_ids)
+        values[hit] = MASK_VALUE
+        observed &= ~hit
+
+    if frac > 0:
+        for i in range(gene_ids.shape[0]):
+            idx = observed[i].nonzero(as_tuple=True)[0]
+            if len(idx) == 0:
+                continue
+            n_mask = max(1, int(len(idx) * frac))
+            values[i, idx[torch.randperm(len(idx), device=idx.device)[:n_mask]]] = MASK_VALUE
+
+    return values
 
 
 @torch.no_grad()
 def predict_multiclock(model, loader, scalers, device, clock_names,
-                       sample_ids=None, mask_frac=0.0, seed=None):
+                       sample_ids=None, mask_frac=0.0, remove_ids=None, seed=None):
     """
     One backbone forward pass per batch, fanned out to every clock head.
 
@@ -295,13 +310,16 @@ def predict_multiclock(model, loader, scalers, device, clock_names,
     model.eval()
     if seed is not None:
         torch.manual_seed(seed)
+    if remove_ids is not None:
+        remove_ids = torch.as_tensor(remove_ids, dtype=torch.long, device=device)
 
     preds  = {n: [] for n in clock_names}
     truths = {n: [] for n in clock_names}
 
     for gene_ids, _, target_vals, ages, _, _ in loader:
         gene_ids = gene_ids.to(device)
-        values   = _mask_observed(gene_ids, target_vals.to(device), mask_frac, model.pad_id)
+        values   = _apply_masking(gene_ids, target_vals.to(device), model.pad_id,
+                                  frac=mask_frac, remove_ids=remove_ids)
 
         with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
             out = model(gene_ids, values, clock_names=clock_names)
@@ -464,6 +482,103 @@ def coverage_performance(predictions, coverage, clock_names, n_bins=5, min_sampl
     result = pd.concat(frames, ignore_index=True)
     return result[result["n"] >= min_samples].reset_index(drop=True)
 
+
+def rank_cpgs(df, strategy="low_variance"):
+    """
+    Return a vocab-ordered array of CpG token indices, ranked by a chosen
+    strategy so we know which probes to remove first in systematic removal.
+ 
+    Parameters
+    ----------
+    strategy : "low_variance"  — remove lowest-variance probes first
+                                 (least informative across the cohort)
+               "high_variance" — remove highest-variance probes first
+                                 (most informative across the cohort)
+               "mean"          — remove probes with highest absolute mean
+                                 methylation first (most extreme first)
+ 
+    Returns
+    -------
+    ranked_indices : np.ndarray of int — vocab positions, ordered so that
+                     index 0 is removed first
+    strategy_label : str for plot titles / legends
+    """
+    strategy_labels = {
+        "low_variance"  : "ascending variance (least variable first)",
+        "high_variance" : "descending variance (most variable first)",
+        "mean"          : "descending mean absolute value (most extreme first)",
+    }
+    if strategy not in strategy_labels:
+        raise ValueError(f"strategy must be one of {list(strategy_labels)}; got '{strategy}'")
+
+    X  = np.stack(df["data"]) # (n_samples, n_cpgs), may contain NaN
+
+    with np.errstate(all="ignore"):
+        if strategy in ("low_variance", "high_variance"):
+            stat = np.nanvar(X, axis=0)
+        else:  # mean
+            stat = np.nanmean(np.abs(X), axis=0)
+
+    if strategy == "low_variance":
+        # NaN probes go last — already missing so removing them has no effect
+        stat  = np.where(np.isfinite(stat), stat, np.inf)
+        ranked = np.argsort(stat)           # ascending: lowest variance first
+    elif strategy == "high_variance":
+        stat  = np.where(np.isfinite(stat), stat, -np.inf)
+        ranked = np.argsort(stat)[::-1]    # descending: highest variance first
+    else:  # mean
+        stat  = np.where(np.isfinite(stat), stat, -np.inf)
+        ranked = np.argsort(stat)[::-1]    # descending: highest mean first
+
+    return ranked.astype(int), strategy_labels[strategy]
+
+
+def evaluate_systematic_removal(model, loader, scalers, device, clock_names,
+                                ranked_indices, removal_fractions, min_samples=2):
+    """
+    Remove the same CpG probes from EVERY sample, simulating an assay or
+    genomic-region failure, in the order given by `ranked_indices`.
+
+    Parameters
+    ----------
+    ranked_indices    : positions in the vocab-aligned CpG array (the 'data'
+                        column), in removal order; index 0 is removed first.
+                        From rank_cpgs().
+    removal_fractions : fractions of len(ranked_indices) to remove,
+                        e.g. [0.0, 0.1, ..., 0.9]
+
+    Returns
+    -------
+    Long DataFrame [clock, removal_frac, n_removed, total_missing,
+                    n, mae, pearson_r, r2]
+    total_missing is the mean fraction of vocab CpGs the model did not see
+    (real missingness + removed probes), comparable with
+    evaluate_missing_fraction.
+    """
+    ranked_indices = np.asarray(ranked_indices)
+    cpg_ids        = loader.dataset.vocab.CpG_ids             # array position → token ID
+    missing        = np.stack([~np.isfinite(x) for x in loader.dataset.gene_datas])
+    n_vocab        = missing.shape[1]
+    base_missing   = missing.sum(axis=1)
+
+    frames = []
+    for frac in removal_fractions:
+        n_remove = int(frac * len(ranked_indices))
+        removed  = ranked_indices[:n_remove]
+
+        # Removed probes that were already missing don't add to the total
+        hidden = base_missing + n_remove - missing[:, removed].sum(axis=1)
+
+        preds = predict_multiclock(
+            model, loader, scalers, device, clock_names,
+            remove_ids=cpg_ids[removed] if n_remove else None,
+        )
+        frames.append(metrics_by_clock(
+            preds, clock_names, min_samples,
+            removal_frac=frac, n_removed=n_remove,
+            total_missing=float((hidden / n_vocab).mean()),
+        ))
+    return pd.concat(frames, ignore_index=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. Plotting
@@ -672,9 +787,16 @@ def plot_metric_heatmap(table, metric, title=None, mask_diagonal=True, save_path
 # ── Missing-feature plots ────────────────────────────────────────────────────
 
 def plot_missing_fraction_curves(mask_results, metric="mae", clock_names=None,
-                                 ax=None, save_path=None):
-    """Line per clock: performance vs. extra CpGs masked (evaluate_missing_fraction)."""
+                                 x="total_missing", ax=None, save_path=None):
+    """
+    Line per clock: performance vs. missing CpGs (evaluate_missing_fraction).
+
+    x : "total_missing" — real + injected missingness (% of all vocab CpGs)
+        "mask_frac"     — injected masking only (% of observed CpGs)
+    """
     clock_names = clock_names or mask_results["clock"].unique().tolist()
+    xlabel = {"total_missing": "Total CpGs missing (%)",
+              "mask_frac":     "Additional CpGs masked (%)"}[x]
 
     with plt.rc_context(_NM_RC):
         if ax is None:
@@ -684,11 +806,16 @@ def plot_missing_fraction_curves(mask_results, metric="mae", clock_names=None,
 
         cmap = plt.get_cmap("tab10")
         for i, name in enumerate(clock_names):
-            sub = mask_results[mask_results["clock"] == name].sort_values("mask_frac")
-            ax.plot(sub["mask_frac"] * 100, sub[metric], marker="o", markersize=3,
+            sub = mask_results[mask_results["clock"] == name].sort_values(x)
+            ax.plot(sub[x] * 100, sub[metric], marker="o", markersize=3,
                     lw=1.0, color=cmap(i), label=_clean(name))
 
-        ax.set_xlabel("Additional CpGs masked (%)")
+        if x == "total_missing":
+            base = mask_results["total_missing"].min()
+            ax.axvline(base * 100, color="grey", lw=0.6, ls=":", zorder=0)
+            ax.set_xlim(right=100)
+
+        ax.set_xlabel(xlabel)
         ax.set_ylabel(_METRIC_LABEL[metric])
         ax.set_title("Clock performance vs. missing CpGs", pad=4, fontweight="bold")
         ax.legend(frameon=False, loc="best")
@@ -697,6 +824,49 @@ def plot_missing_fraction_curves(mask_results, metric="mae", clock_names=None,
 
     _save(fig, save_path)
     return fig, ax
+
+
+def plot_systematic_removal_curves(systematic_results, random_results=None,
+                                   metric="mae", clock_names=None,
+                                   strategy_label="systematic",
+                                   x="total_missing", save_path=None):
+    """
+    One subplot per clock: performance vs. fraction of probes systematically
+    removed. If `random_results` (evaluate_missing_fraction) is given, the random
+    masking curve is overlaid dashed, so the gap shows whether probe identity
+    matters or any missing data hurts equally.
+    """
+    clock_names = clock_names or systematic_results["clock"].unique().tolist()
+    n_clocks    = len(clock_names)
+
+    with plt.rc_context(_NM_RC):
+        fig, axes = plt.subplots(1, n_clocks, figsize=(min(183, 55 * n_clocks) * _MM, 65 * _MM),
+                                 sharey=True, constrained_layout=True, squeeze=False)
+        axes = axes[0]
+        cmap = plt.get_cmap("tab10")
+
+        for i, (ax, name) in enumerate(zip(axes, clock_names)):
+            sub = systematic_results[systematic_results["clock"] == name].sort_values(x)
+            ax.plot(sub[x] * 100, sub[metric], marker="o", markersize=3,
+                    lw=1.0, color=cmap(i), label=strategy_label)
+
+            if random_results is not None:
+                rsub = random_results[random_results["clock"] == name].sort_values(x)
+                ax.plot(rsub[x] * 100, rsub[metric], marker="s", markersize=3,
+                        lw=1.0, color=cmap(i), ls="--", alpha=0.6, label="random")
+
+            ax.set_title(_clean(name), pad=4, fontweight="bold")
+            ax.set_xlabel("Total CpGs missing (%)" if x == "total_missing" else "CpGs removed (%)")
+            if not _HIGH_IS_GOOD[metric]:
+                ax.set_ylim(bottom=0)
+            ax.legend(frameon=False, fontsize=5)
+
+        axes[0].set_ylabel(_METRIC_LABEL[metric])
+        fig.suptitle(f"Systematic probe removal — {_METRIC_LABEL[metric]}",
+                     fontsize=8, fontweight="bold")
+
+    _save(fig, save_path)
+    return fig, axes
 
 
 def plot_coverage_performance(coverage_results, metric="mae", clock_names=None,

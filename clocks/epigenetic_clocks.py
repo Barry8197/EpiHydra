@@ -1433,6 +1433,38 @@ class GrimAgeV2:
 
         return parsed
 
+    @property
+    def coefficients(self) -> pd.DataFrame:
+        """
+        Return a two-column DataFrame of all CpG probes used across all
+        sub-components, mirroring the flat {CPG_COL, COEF_COL} format
+        exposed by single-stage clocks (Hannum, Horvath, PhenoAge).
+        
+        Probes appearing in multiple sub-components are deduplicated;
+        coefficients are summed across sub-components for consistency,
+        though the primary use-case is probe-set extraction for missingness
+        analysis.
+        """
+        if self._coef_raw is None:
+            raise ValueError("No coefficients loaded.")
+        
+        if self._parsed is None:
+            self._parsed = self._parse_coefficients(self._coef_raw)
+        
+        # Collect all CpG rows across sub-components
+        rows = []
+        for sub in self._parsed["sub_components"].values():
+            rows.append(sub["cpg_coefs"])
+        
+        combined = pd.concat(rows)
+        # Deduplicate by summing (a probe shared across sub-components
+        # has an aggregate contribution; for probe-set purposes only the
+        # index matters)
+        combined = combined.groupby(level=0).sum()
+        combined.index.name = "CpG"
+        
+        return combined.reset_index().rename(columns={0: "Coefficient"})
+
     # ── Internal: predict a single sub-component ─────────────────────
     def _predict_sub_component(
         self,
@@ -1846,6 +1878,11 @@ class GrimAgeAdapter:
             verbose=verbose,
         )
         return result[["DNAmAge"]]
+
+    @property
+    def coefficients(self) -> pd.DataFrame:
+        """Delegate to the underlying GrimAgeV2 instance."""
+        return self._clock.coefficients
 
 
 def run_all_clocks(
