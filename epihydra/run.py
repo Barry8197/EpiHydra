@@ -44,14 +44,22 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
 
-from methylgpt import MethylGPTModel, MethylVocab
 from scgpt.model.model import TransformerModel
 
 from peft import LoraConfig, get_peft_model
 
-from epihydra import VocabWrapper, AgePredictor, load_backbone
-from train import build_dataloaders, train_one_epoch, evaluate
-
+from epihydra import (
+    VocabWrapper,
+    AgePredictor,
+    LinearProbeHead,
+    init_head_from_ridge,
+    load_backbone,
+    build_dataloaders,
+    train_one_epoch,
+    evaluate,
+    precompute_cpg_ranks,
+    DEFAULT_MASK_WEIGHTS
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -74,7 +82,11 @@ def parse_args():
                    help="Root checkpoint directory (shared across runs)")
 
     g = p.add_argument_group("Training")
-    g.add_argument("--epochs",       default=50,   type=int)
+    g.add_argument("--epochs",       default=50,   type=int,
+                   help="Stage-2 epochs (head + LoRA)")
+    g.add_argument("--head_epochs",  default=0,    type=int,
+                   help="Stage-1 epochs training the head only, LoRA frozen "
+                        "(0 = single-stage training, as before)")
     g.add_argument("--batch_size",   default=128,  type=int)
     g.add_argument("--lr_head",      default=1e-4, type=float)
     g.add_argument("--lr_lora",      default=1e-4, type=float)
@@ -89,7 +101,11 @@ def parse_args():
     g = p.add_argument_group("Model")
     g.add_argument("--num_heads", default=4,   type=int,
                    help="Attention heads in pooling head")
+    g.add_argument("--n_queries", default=1,   type=int,
+                   help="Number of learned query vectors in attention pooling head")
     g.add_argument("--dropout",   default=0.1, type=float)
+    g.add_argument("--head_type", default="probe", choices=["probe", "attention"],
+                   help="probe = ridge-initialised linear head; attention = original pooling head")
 
     g = p.add_argument_group("Data splits")
     g.add_argument("--train_ratio",  default=0.70, type=float)
@@ -164,17 +180,16 @@ def validate_model_dir(model_dir):
 def build_run_id(args, pretrain_config):
     """
     Unique, human-readable run identifier.
-
-    Format: nlayers{N}_nhead{N}_emb{N}_lr{lr}_bs{bs}_mask{m}_heads{h}_{timestamp}
+ 
+    Format: nlayers{N}_nhead{N}_emb{N}_lora{r}a{alpha}_lr{lr}_heads{h}_{timestamp}
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     parts = [
         f"nlayers{pretrain_config['nlayers']}",
         f"nhead{pretrain_config['nhead']}",
         f"emb{pretrain_config['layer_size']}",
-        f"lr{args.lr_head:.0e}",
-        f"bs{args.batch_size}",
-        f"mask{args.mask_ratio}",
+        f"lora{args.lora_r}a{args.lora_alpha}",
+        f"lr{args.lr_lora:.0e}",
         f"heads{args.num_heads}",
         timestamp,
     ]
@@ -212,6 +227,29 @@ def build_run_id(args, pretrain_config):
 #         )
 #         writer.add_text("attention/top10_positions", top_str, epoch)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Recalibrate Batch Norm
+# ──────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def recalibrate_bn(model, loader, device, n_batches=40):
+    """Re-estimate the head's BatchNorm running stats with the current weights."""
+    bns = [m for m in model.head.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    if not bns:
+        return
+    for bn in bns:
+        bn.reset_running_stats()
+        bn.momentum = None                     # cumulative average over the batches below
+    model.eval()                               # backbone stays in eval mode (no dropout)
+    model.head.train()                         # only the head's BatchNorm collects statistics
+    for i, (gene_ids, _, target_vals, *_) in enumerate(loader):
+        if i >= n_batches:
+            break
+        with torch.cuda.amp.autocast():
+            model(gene_ids.to(device), target_vals.to(device))
+    for bn in bns:
+        bn.momentum = 0.1
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
@@ -291,6 +329,7 @@ def main():
     valid_loader = splits["valid_loader"]
     test_loader  = splits["test_loader"]
     scaler       = splits["scaler"]
+    cpg_ranks = precompute_cpg_ranks(splits["train_df"])
 
     writer.add_text("data/cpg_coverage",
         f"Present: {splits['n_present_cpgs']} | Missing: {splits['n_missing_cpgs']}")
@@ -310,7 +349,15 @@ def main():
         pad_id    = pad_id,
         num_heads = args.num_heads,
         dropout   = args.dropout,
+        n_queries = args.n_queries,
     ).to(device)
+
+    if args.head_type == "probe":
+        age_model.head = LinearProbeHead(pretrain_config["layer_size"]).to(device)
+        init_head_from_ridge(age_model, train_loader, scaler, device, pad_id)
+        recalibrate_bn(age_model, train_loader, device)
+        probe_mae, *_ = evaluate(age_model, valid_loader, scaler, device)
+        print(f"Head initialised from ridge probe | valid MAE {probe_mae:.2f} yrs")
 
     config = LoraConfig(
         r=args.lora_r,                              
@@ -331,21 +378,43 @@ def main():
     writer.add_text("model/params", f"Total: {n_total:,} | Trainable: {n_trainable:,}")
 
     # ── Optimiser, scheduler, loss ───────────────────────────────────
-    optimizer = torch.optim.AdamW([
-        {"params": [p for p in age_model.backbone.parameters() if p.requires_grad], "lr": args.lr_lora},
-        {"params": age_model.head.parameters(), "lr": args.lr_head},
-    ], weight_decay=args.weight_decay)
-    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6,
-    )
+    # Collected once, while PEFT still has them marked trainable.
+    lora_params = [p for p in age_model.backbone.parameters() if p.requires_grad]
+
+    def make_optimizer(stage):
+        """Stage 1: head only, constant LR. Stage 2: head + LoRA, cosine over --epochs."""
+        train_lora = stage == 2
+        for p in lora_params:
+            p.requires_grad_(train_lora)   # frozen -> AgePredictor runs the backbone under no_grad
+        groups = [{"params": age_model.head.parameters(), "lr": args.lr_head}]
+        if train_lora:
+            groups.insert(0, {"params": lora_params, "lr": args.lr_lora})
+        opt = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+        if train_lora:
+            warm = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=2)
+            cos  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs - 5, eta_min=1e-6)
+            sch  = torch.optim.lr_scheduler.SequentialLR(opt, [warm, cos], milestones=[5])
+        else:
+            sch = torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 1.0)
+        return opt, sch
+
+    stage = 1 if args.head_epochs > 0 else 2
+    optimizer, scheduler = make_optimizer(stage)
     criterion  = nn.MSELoss()
     scaler_amp = torch.cuda.amp.GradScaler()
 
     # ── Training loop ────────────────────────────────────────────────
     best_mae, best_epoch = float("inf"), 0
-    print(f"Training for {args.epochs} epochs...\n")
+    total_epochs = args.head_epochs + args.epochs
+    print(f"Training for {total_epochs} epochs "
+          f"({args.head_epochs} head-only + {args.epochs} head + LoRA)...\n")
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, total_epochs + 1):
+
+        if stage == 1 and epoch == args.head_epochs + 1:
+            stage = 2
+            optimizer, scheduler = make_optimizer(stage)
+            print("\n── Stage 2: LoRA unfrozen ──\n")
 
         train_loss = train_one_epoch(
             age_model, train_loader, optimizer,
@@ -354,7 +423,8 @@ def main():
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        valid_mae, _, _ = evaluate(age_model, valid_loader, scaler, device)
+        recalibrate_bn(age_model, train_loader, device)
+        valid_mae, _, _, _ = evaluate(age_model, valid_loader, scaler, device)
 
         writer.add_scalar("loss/train", train_loss, epoch)
         writer.add_scalar("mae/valid",  valid_mae,  epoch)
@@ -378,7 +448,7 @@ def main():
             )
 
         print(
-            f"Epoch {epoch:3d}/{args.epochs} | "
+            f"[S{stage}] Epoch {epoch:3d}/{total_epochs} | "
             f"Train loss: {train_loss:.4f} | "
             f"Valid MAE: {valid_mae:.2f} yrs | "
             f"Best: {best_mae:.2f} yrs (ep {best_epoch}) | "
@@ -393,7 +463,7 @@ def main():
     checkpoint = torch.load(ckpt_dir / "best_model.pt", map_location=device)
     age_model.load_state_dict(checkpoint["model_state"])
 
-    test_mae, test_preds, test_labels = evaluate(age_model, test_loader, scaler, device)
+    test_mae, test_preds, test_labels, test_ids = evaluate(age_model, test_loader, scaler, device)
     test_r2   = r2_score(test_labels, test_preds)
     test_r, _ = pearsonr(test_labels, test_preds)
 
@@ -436,6 +506,7 @@ def main():
         "test_mae"       : test_mae,
         "test_r2"        : test_r2,
         "test_pearson_r" : test_r,
+        "test_ids"       : test_ids,
     }
     with open(log_path / "test_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)

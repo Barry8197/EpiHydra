@@ -196,6 +196,106 @@ def predict_methylation_age(
 
 
 # =====================================================================
+# GENERIC — per-CpG imputation of missing values
+# =====================================================================
+
+def build_cpg_reference(
+    datasets: Union[Dict[str, pd.DataFrame], List[pd.DataFrame]],
+    cpgs: Optional[set] = None,
+) -> pd.Series:
+    """
+    Per-CpG reference beta values for imputing CpGs that are missing in every
+    sample of a dataset.
+
+    Each CpG's reference is the average of its per-dataset medians, so every
+    dataset counts equally regardless of its size. A CpG absent from all
+    datasets gets NaN (the clock's own fallback then applies).
+
+    Parameters
+    ----------
+    datasets : dict or list of DataFrames shaped (n_CpGs, n_samples),
+        CpG IDs as index. NaNs allowed.
+    cpgs : set, optional
+        Only compute the reference for these CpGs (e.g. ``clock_cpgs(clocks)``).
+        Strongly recommended: clocks use ~1,000 CpGs, arrays have ~450–865k.
+
+    Returns
+    -------
+    pd.Series indexed by CpG ID.
+    """
+    frames = datasets.values() if isinstance(datasets, dict) else datasets
+    medians = []
+    for df in frames:
+        sub = df if cpgs is None else df.loc[df.index.intersection(list(cpgs))]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)       # all-NaN rows -> NaN
+            med = np.nanmedian(sub.to_numpy(dtype=float), axis=1)
+        medians.append(pd.Series(med, index=sub.index))
+    if not medians:
+        return pd.Series(dtype=float)
+    return pd.concat(medians, axis=1).mean(axis=1)
+
+
+def impute_per_cpg(
+    methylation: pd.DataFrame,
+    reference: Optional[pd.Series] = None,
+    within_cohort: bool = True,
+) -> pd.DataFrame:
+    """
+    Fill missing beta values CpG by CpG (never with a per-sample value).
+
+    1. within_cohort : a CpG missing in some samples gets that CpG's median
+                       across the dataset's other samples.
+    2. reference     : a CpG still missing (i.e. missing in every sample of the
+                       dataset) gets its value from ``reference``
+                       (see :func:`build_cpg_reference`).
+
+    CpGs that remain all-NaN are left as NaN; :func:`run_all_clocks` drops
+    them, so the clock treats them as missing and applies its fallback.
+
+    Parameters
+    ----------
+    methylation : DataFrame (n_CpGs, n_samples), CpG IDs as index.
+    reference   : Series indexed by CpG ID, optional.
+    within_cohort : bool
+
+    Returns
+    -------
+    DataFrame of the same shape.
+    """
+    arr = methylation.to_numpy(dtype=float, copy=True)        # never modifies the input
+    if within_cohort:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)       # all-NaN rows -> NaN
+            med = np.nanmedian(arr, axis=1)
+        rows, cols = np.where(np.isnan(arr))
+        arr[rows, cols] = med[rows]
+    if reference is not None:
+        ref = reference.reindex(methylation.index).to_numpy(dtype=float)
+        rows, cols = np.where(np.isnan(arr))
+        arr[rows, cols] = ref[rows]
+    return pd.DataFrame(arr, index=methylation.index, columns=methylation.columns)
+
+
+def clock_cpgs(clocks: Union[List[Any], Dict[str, Any]]) -> set:
+    """Union of CpG IDs used by the given clocks (empty if any clock hides them)."""
+    items = clocks.values() if isinstance(clocks, dict) else clocks
+    sets = [_clock_cpgs(c) for c in items]
+    if not sets or any(not s for s in sets):
+        return set()
+    return set().union(*sets)
+
+
+def _clock_cpgs(clock: Any) -> set:
+    """CpG IDs a clock uses, if it exposes ``coefficients`` and ``CPG_COL``."""
+    coefs   = getattr(clock, "coefficients", None)
+    cpg_col = getattr(clock, "CPG_COL", None)
+    if coefs is None or cpg_col is None or cpg_col not in getattr(coefs, "columns", []):
+        return set()
+    return set(coefs[cpg_col])
+
+
+# =====================================================================
 # GENERIC — evaluation metrics
 # =====================================================================
 DEFAULT_METRIC_NAMES: Dict[str, str] = {
@@ -1892,6 +1992,8 @@ def run_all_clocks(
     *,
     chron_ages: Optional[Dict[str, pd.Series]] = None,
     impute_missing: bool = True,
+    impute_within_cohort: bool = True,
+    impute_reference: Optional[pd.Series] = None,
     save_summary: bool = True,
     verbose: bool = True,
 ) -> Dict[str, pd.DataFrame]:
@@ -1937,7 +2039,16 @@ def run_all_clocks(
         chronological ages in years. If a dataset name is absent,
         ``chron_age`` is filled with NaN for all its samples.
     impute_missing : bool
-        Passed through to each clock's ``predict`` call.
+        Passed through to each clock's ``predict`` call. Applies only to
+        clock CpGs still missing after the per-CpG imputation below.
+    impute_within_cohort : bool
+        If True (default), missing values of a CpG are filled with that
+        CpG's median across the dataset's other samples before any clock
+        runs (see :func:`impute_per_cpg`).
+    impute_reference : pd.Series, optional
+        Per-CpG reference values (see :func:`build_cpg_reference`) used for
+        CpGs missing in every sample of a dataset. Without it, such CpGs
+        fall back to each clock's ``impute_missing`` behaviour (beta 0.5).
     save_summary : bool
         If True, also writes ``save_path/all_datasets_summary.csv``
         stacking all per-dataset matrices with a leading ``dataset``
@@ -2056,7 +2167,46 @@ def run_all_clocks(
             print(f"  Samples : {methylation.shape[1]}   CpGs : {methylation.shape[0]}")
             print(f"{'=' * _W}")
 
-        # ── 2a. Run each clock ──────────────────────────────────────
+        # ── 2a. Restrict to clock CpGs, then per-CpG imputation ─────
+        needed = clock_cpgs(named_clocks)
+        if needed:
+            # clocks only read their own CpGs; working on ~1k rows instead of
+            # ~450–865k makes everything below fast
+            methylation = methylation.loc[methylation.index.intersection(list(needed))]
+        if verbose:
+            if needed:
+                in_data  = needed & set(methylation.index)
+                all_nan  = methylation.loc[list(in_data)].isna().all(axis=1) if in_data else pd.Series(dtype=bool)
+                any_nan  = methylation.loc[list(in_data)].isna().any(axis=1) if in_data else pd.Series(dtype=bool)
+                n_whole  = len(needed - in_data) + int(all_nan.sum())
+                n_part   = int((any_nan & ~all_nan).sum())
+                n_ref    = 0
+                if impute_reference is not None:
+                    whole = (needed - in_data) | set(all_nan[all_nan].index)
+                    n_ref = int(impute_reference.reindex(list(whole)).notna().sum())
+                print(f"  Clock CpGs : {len(needed)} | partly missing: {n_part} "
+                      f"(cohort median) | missing in all samples: {n_whole} "
+                      f"({n_ref} from reference, {n_whole - n_ref} → clock fallback)")
+
+        methylation_imp = impute_per_cpg(
+            methylation,
+            reference=impute_reference,
+            within_cohort=impute_within_cohort,
+        )
+        if impute_reference is not None and needed:
+            # CpGs absent from the matrix but available in the reference
+            absent = impute_reference.index.difference(methylation_imp.index)
+            add = [g for g in absent if g in needed and pd.notna(impute_reference[g])]
+            if add:
+                extra = pd.DataFrame(
+                    np.repeat(impute_reference[add].to_numpy()[:, None],
+                              methylation_imp.shape[1], axis=1),
+                    index=add, columns=methylation_imp.columns,
+                )
+                methylation_imp = pd.concat([methylation_imp, extra])
+        methylation_imp = methylation_imp.dropna(how="all")
+
+        # ── 2b. Run each clock ──────────────────────────────────────
         clock_frames: List[pd.DataFrame] = []
 
         for col_name, clock in named_clocks.items():
@@ -2066,7 +2216,7 @@ def run_all_clocks(
                 pred = (
                     clock
                     .predict(
-                        methylation.dropna(how='all'),
+                        methylation_imp,
                         impute_missing=impute_missing,
                         verbose=verbose,
                     )
@@ -2088,7 +2238,7 @@ def run_all_clocks(
                     )
                 )
 
-        # ── 2b. Assemble age matrix ─────────────────────────────────
+        # ── 2c. Assemble age matrix ─────────────────────────────────
         age_matrix = (
             pd.concat(clock_frames, axis=1)
             if clock_frames
@@ -2097,7 +2247,7 @@ def run_all_clocks(
             )
         )
 
-        # ── 2c. Attach chronological age ────────────────────────────
+        # ── 2d. Attach chronological age ────────────────────────────
         if dataset_name in chron_ages:
             chron_series = chron_ages[dataset_name].rename("chron_age")
             chron_series.index.name = "SampleID"
@@ -2116,7 +2266,7 @@ def run_all_clocks(
                     "chron_age \u2192 NaN."
                 )
 
-        # ── 2d. Save ────────────────────────────────────────────────
+        # ── 2e. Save ────────────────────────────────────────────────
         out_dir = save_path / dataset_name
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "age_predictions.csv"

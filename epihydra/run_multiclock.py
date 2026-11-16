@@ -56,20 +56,28 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import r2_score
 from scipy.stats import pearsonr
 
-from methylgpt import MethylGPTModel, MethylVocab
 from scgpt.model.model import TransformerModel
 
-from epihydra import ( 
-    VocabWrapper, 
-    MultiClockPredictor, 
+from epihydra import (
+    VocabWrapper,
+    AgePredictor,
+    LinearProbeHead,
+    init_head_from_ridge,
     load_backbone,
+    build_dataloaders,
     build_multiclock_dataloaders,
     train_one_epoch_multiclock,
     evaluate_multiclock,
+    MultiClockPredictor,
+    train_one_epoch,
+    evaluate,
+    precompute_cpg_ranks,
+    DEFAULT_MASK_WEIGHTS
 )
 
 # Must match the target_modules used when the adapters were trained (run.py)
@@ -330,30 +338,54 @@ def safe_filename(name):
 # Attention logging
 # ──────────────────────────────────────────────────────────────────────────────
 
+# @torch.no_grad()
+# def log_attention_weights(model, loader, device, writer, epoch, clock_names):
+#     """
+#     Log per-clock attention weight histograms.
+
+#     NOTE: attention is logged as a distribution only. Position indices are NOT
+#     reported, because pad_batch subsamples and reorders probes per sample, so
+#     column j refers to a different CpG in every row. Mapping attention back to
+#     probes requires scattering through gene_ids into vocab space.
+#     """
+#     model.eval()
+
+#     gene_ids, _, target_vals, _, _, _ = next(iter(loader))
+#     gene_ids    = gene_ids.to(device)
+#     target_vals = target_vals.to(device)
+
+#     sequence_hidden, mask = model.encode(gene_ids, target_vals)
+
+#     for name in clock_names:
+#         _, attn_weights = model.heads[name](sequence_hidden, key_padding_mask=mask)
+#         writer.add_histogram(
+#             f"attention/{name}/weights", attn_weights.float().flatten(), epoch
+#         )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Recalibrate Batch Norm
+# ──────────────────────────────────────────────────────────────────────────────
+
 @torch.no_grad()
-def log_attention_weights(model, loader, device, writer, epoch, clock_names):
-    """
-    Log per-clock attention weight histograms.
-
-    NOTE: attention is logged as a distribution only. Position indices are NOT
-    reported, because pad_batch subsamples and reorders probes per sample, so
-    column j refers to a different CpG in every row. Mapping attention back to
-    probes requires scattering through gene_ids into vocab space.
-    """
-    model.eval()
-
-    gene_ids, _, target_vals, _, _, _ = next(iter(loader))
-    gene_ids    = gene_ids.to(device)
-    target_vals = target_vals.to(device)
-
-    sequence_hidden, mask = model.encode(gene_ids, target_vals)
-
-    for name in clock_names:
-        _, attn_weights = model.heads[name](sequence_hidden, key_padding_mask=mask)
-        writer.add_histogram(
-            f"attention/{name}/weights", attn_weights.float().flatten(), epoch
-        )
-
+def recalibrate_bn_multiclock(model, loader, device, clock_names, n_batches=40):
+    """Re-estimate every head's BatchNorm running stats with the current weights."""
+    bns = [m for n in clock_names for m in model.heads[n].modules()
+           if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    if not bns:
+        return
+    for bn in bns:
+        bn.reset_running_stats()
+        bn.momentum = None
+    model.eval()                               # everything in eval mode, dropout off
+    for bn in bns:
+        bn.train() 
+    for i, (gene_ids, _, target_vals, *_) in enumerate(loader):
+        if i >= n_batches:
+            break
+        with torch.cuda.amp.autocast():
+            model(gene_ids.to(device), target_vals.to(device))
+    for bn in bns:
+        bn.momentum = 0.1
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Plotting
@@ -551,6 +583,7 @@ def main():
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
+        recalibrate_bn_multiclock(model, train_loader, device, clock_names)
         valid_results = evaluate_multiclock(
             model, valid_loader, scalers, device, clock_names,
         )
@@ -593,8 +626,8 @@ def main():
                 f"best {best[name]['mae']:.2f} (ep {best[name]['epoch']}){improved}"
             )
 
-        if args.log_every and epoch % args.log_every == 0:
-            log_attention_weights(model, valid_loader, device, writer, epoch, clock_names)
+        # if args.log_every and epoch % args.log_every == 0:
+        #     log_attention_weights(model, valid_loader, device, writer, epoch, clock_names)
 
         print(f"Epoch {epoch:3d}/{args.epochs} | LR: {current_lr:.2e}")
         print("\n".join(lines))

@@ -21,7 +21,10 @@ from torch.utils.data import DataLoader
 
 from scgpt.tokenizer import tokenize_and_pad_batch, random_mask_value
 
-from epihydra import VocabWrapper, AgeDataset, MultiClockDataset
+from epihydra import (
+    VocabWrapper, AgeDataset, MultiClockDataset, 
+    precompute_cpg_ranks, DEFAULT_MASK_WEIGHTS,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data loading
@@ -36,6 +39,7 @@ def build_dataloaders(
     valid_ratio  = 0.15,
     test_ratio   = 0.15,
     mask_ratio   = 0.15,
+    mask_weights = None,
     batch_size   = 16,
     num_workers  = 0,
     random_state = 42,
@@ -66,7 +70,11 @@ def build_dataloaders(
     train_ratio,
     valid_ratio,
     test_ratio   : float — must sum to 1.0, or all None to skip splitting
-    mask_ratio   : float — upper bound on random masking applied to train split
+    mask_ratio   : float — upper bound on masking applied to train split.
+    mask_weights : dict[str, float] | None — per-strategy sampling probabilities,
+                   e.g. {"uniform": 0.6, "low_variance": 0.2, "high_variance": 0.2}.
+                   Defaults to (60/20/20). CpG variance ranks
+                   are computed automatically from the training split.
     batch_size   : int
     num_workers  : int — 0 for Windows/macOS; ≥1 recommended on Linux cluster
     random_state : int
@@ -80,6 +88,7 @@ def build_dataloaders(
             train_loader, valid_loader, test_loader : DataLoader
             train_df, valid_df, test_df             : DataFrame
             scaler                                  : MinMaxScaler fit on train ages
+            all_cpg_ranks                           : dict[str, np.ndarray]
             n_present_cpgs, n_missing_cpgs          : int
         If no splits (all ratios None):
             loader                                  : DataLoader
@@ -167,7 +176,8 @@ def build_dataloaders(
             if verbose:
                 print("ℹ  Reusing supplied pre-fitted scaler.")
 
-        dataset = AgeDataset(vocab, combined_df, scaler, clock_age, mask_ratio=0.0)
+        all_cpg_ranks = precompute_cpg_ranks(combined_df)
+        dataset = AgeDataset(vocab, combined_df, scaler, clock_age=clock_age, mask_ratio=0.0, mask_weights=mask_weights, all_cpg_ranks=all_cpg_ranks)
         loader  = DataLoader(
             dataset,
             batch_size  = batch_size,
@@ -218,10 +228,26 @@ def build_dataloaders(
         if verbose:
             print("ℹ  Reusing supplied pre-fitted scaler.")
 
-    # ── 8. Build AgeDataset for each split ──────────────────────────────────
-    train_dataset = AgeDataset(vocab, train_df, scaler, clock_age, mask_ratio=mask_ratio)
-    valid_dataset = AgeDataset(vocab, valid_df, scaler, clock_age, mask_ratio=0.0)
-    test_dataset  = AgeDataset(vocab, test_df,  scaler, clock_age, mask_ratio=0.0)
+    # ── 8. Compute CpG variance ranks (train split only — no data leakage) ────
+    weights = mask_weights or DEFAULT_MASK_WEIGHTS
+    all_cpg_ranks = precompute_cpg_ranks(train_df)
+    if verbose:
+        w = {k: weights.get(k, 0) for k in ("uniform", "low_variance", "high_variance")}
+        total = sum(w.values())
+        print(f"ℹ  CpG variance ranks computed ({len(vocab.CpG_ids):,} probes). "
+              f"Mask modes: uniform={w['uniform']/total:.0%}, "
+              f"high_var={w['high_variance']/total:.0%}, "
+              f"low_var={w['low_variance']/total:.0%}")
+
+    # ── 9. Build AgeDataset for each split ───────────────────────────────────
+    train_dataset = AgeDataset(
+        vocab, train_df, scaler, clock_age=clock_age,
+        mask_ratio=mask_ratio, mask_weights=weights, all_cpg_ranks=all_cpg_ranks,
+    )
+    valid_dataset = AgeDataset(vocab, valid_df, scaler, clock_age=clock_age, mask_ratio=0.0,
+                               mask_weights={"uniform": 1.0})
+    test_dataset  = AgeDataset(vocab, test_df,  scaler, clock_age=clock_age, mask_ratio=0.0,
+                               mask_weights={"uniform": 1.0})
 
     # ── 9. Build DataLoaders ─────────────────────────────────────────────────
     train_loader = DataLoader(
@@ -258,6 +284,7 @@ def build_dataloaders(
         "valid_df"       : valid_df,
         "test_df"        : test_df,
         "scaler"         : scaler,
+        "all_cpg_ranks"  : all_cpg_ranks,
         "n_present_cpgs" : len(present_cpgs),
         "n_missing_cpgs" : len(missing_cpgs),
     }
@@ -271,6 +298,7 @@ def build_multiclock_dataloaders(
     valid_ratio  = 0.15,
     test_ratio   = 0.15,
     mask_ratio   = 0.15,
+    mask_weights = None,
     batch_size   = 16,
     num_workers  = 0,
     random_state = 42,
@@ -366,7 +394,7 @@ def build_multiclock_dataloaders(
     vocab_cpg_order = [
         vocab.vocab.lookup_token(int(i)) for i in vocab.CpG_ids
     ]
-    data_cpgs    = set(cpg.dropna().index)
+    data_cpgs = set(cpg.dropna(how="all").index)
     present_cpgs = [c for c in vocab_cpg_order if c     in data_cpgs]
     missing_cpgs = [c for c in vocab_cpg_order if c not in data_cpgs]
 
@@ -413,8 +441,9 @@ def build_multiclock_dataloaders(
             scalers[name] = scaler
             if verbose:
                 print(f"ℹ  {name:<20}: scaler fitted on all values (no-split mode).")
-
-        dataset = MultiClockDataset(vocab, combined_df, scalers, clock_names, mask_ratio=0.0)
+                
+        all_cpg_ranks = precompute_cpg_ranks(combined_df)
+        dataset = MultiClockDataset(vocab, combined_df, scalers, clock_names, mask_ratio=0.0, mask_weights=mask_weights, all_cpg_ranks=all_cpg_ranks)
         loader  = DataLoader(
             dataset,
             batch_size  = batch_size,
@@ -473,10 +502,26 @@ def build_multiclock_dataloaders(
         if verbose:
             print(f"ℹ  {name:<20}: scaler fitted on training values.")
 
-    # ── 8. Build MultiClockDataset for each split ────────────────────────────
-    train_dataset = MultiClockDataset(vocab, train_df, scalers, clock_names, mask_ratio=mask_ratio)
-    valid_dataset = MultiClockDataset(vocab, valid_df, scalers, clock_names, mask_ratio=0.0)
-    test_dataset  = MultiClockDataset(vocab, test_df,  scalers, clock_names, mask_ratio=0.0)
+    # ── 8. Compute CpG variance ranks (train split only — no data leakage) ────
+    weights = mask_weights or DEFAULT_MASK_WEIGHTS
+    all_cpg_ranks = precompute_cpg_ranks(train_df)
+    if verbose:
+        w = {k: weights.get(k, 0) for k in ("uniform", "low_variance", "high_variance")}
+        total = sum(w.values())
+        print(f"ℹ  CpG variance ranks computed ({len(vocab.CpG_ids):,} probes). "
+              f"Mask modes: uniform={w['uniform']/total:.0%}, "
+              f"high_var={w['high_variance']/total:.0%}, "
+              f"low_var={w['low_variance']/total:.0%}")
+
+    # ── 9. Build MultiClockDataset for each split ─────────────────────────────
+    train_dataset = MultiClockDataset(
+        vocab, train_df, scalers, clock_names,
+        mask_ratio=mask_ratio, mask_weights=weights, all_cpg_ranks=all_cpg_ranks,
+    )
+    valid_dataset = MultiClockDataset(vocab, valid_df, scalers, clock_names,
+                                      mask_ratio=0.0, mask_weights={"uniform": 1.0})
+    test_dataset  = MultiClockDataset(vocab, test_df,  scalers, clock_names,
+                                      mask_ratio=0.0, mask_weights={"uniform": 1.0})
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, collate_fn=train_dataset.collater,
@@ -502,108 +547,11 @@ def build_multiclock_dataloaders(
         "valid_df"            : valid_df,
         "test_df"             : test_df,
         "scalers"             : scalers,
+        "all_cpg_ranks"       : all_cpg_ranks,
         "n_present_cpgs"      : len(present_cpgs),
         "n_missing_cpgs"      : len(missing_cpgs),
         "n_present_per_clock" : n_present_per_clock,
     }
-    
-
-def train_one_epoch_multiclock(model, loader, optimizer, scaler_amp, device, clock_names):
-    """
-    One epoch of joint multi-clock head training.
-
-    A single backbone forward pass per batch (model.encode) feeds every
-    clock head; per-clock MSE is masked to only the samples that actually
-    have a label for that clock, then summed into one loss for one backward
-    pass covering all heads simultaneously.
-
-    Returns
-    -------
-    dict[str, float] — mean training loss per clock this epoch
-    """
-    model.train()
-    model.backbone.eval()  # backbone frozen: keep its dropout/BN off regardless of .train()
-
-    per_clock_losses = {name: [] for name in clock_names}
-
-    for gene_ids, masked_vals, _, ages, valid, ages_norm in loader:
-        gene_ids    = gene_ids.to(device)
-        masked_vals = masked_vals.to(device)
-
-        optimizer.zero_grad()
-        with torch.cuda.amp.autocast():
-            preds = model(gene_ids, masked_vals, clock_names=clock_names)
-
-            total_loss = 0.0
-            batch_losses = {}
-            for name in clock_names:
-                v = valid[name].to(device)
-                if v.sum() == 0:
-                    continue  # no labeled samples for this clock in this batch
-                target = ages_norm[name].to(device)[v]
-                pred   = preds[name][v]
-                loss   = nn.functional.mse_loss(pred, target)
-                total_loss = total_loss + loss
-                batch_losses[name] = loss.item()
-
-        if isinstance(total_loss, torch.Tensor):
-            scaler_amp.scale(total_loss).backward()
-            scaler_amp.step(optimizer)
-            scaler_amp.update()
-
-        for name, l in batch_losses.items():
-            per_clock_losses[name].append(l)
-
-    return {
-        name: float(np.mean(losses)) if losses else float("nan")
-        for name, losses in per_clock_losses.items()
-    }
-
-
-@torch.no_grad()
-def evaluate_multiclock(model, loader, scalers, device, clock_names):
-    """
-    Run inference for every clock head, return per-clock MAE + predictions.
-
-    Returns
-    -------
-    dict[str, dict] — keyed by clock name, each value has
-        {"mae": float, "preds": np.ndarray, "labels": np.ndarray}
-    (preds/labels only include samples that actually had a label for that
-    clock; clocks with zero labeled samples in this loader return NaN mae
-    and empty arrays.)
-    """
-    model.eval()
-
-    all_preds  = {name: [] for name in clock_names}
-    all_labels = {name: [] for name in clock_names}
-
-    for gene_ids, _, target_vals, ages, valid, _ in loader:
-        gene_ids    = gene_ids.to(device)
-        target_vals = target_vals.to(device)
-
-        with torch.cuda.amp.autocast():
-            preds = model(gene_ids, target_vals, clock_names=clock_names)
-
-        for name in clock_names:
-            v = valid[name].numpy()
-            if v.sum() == 0:
-                continue
-            pred_norm = preds[name].float().cpu().numpy()[v]
-            pred_age  = scalers[name].inverse_transform(
-                pred_norm.reshape(-1, 1)
-            ).flatten()
-            all_preds[name].extend(pred_age)
-            all_labels[name].extend(ages[name].numpy()[v])
-
-    results = {}
-    for name in clock_names:
-        preds  = np.array(all_preds[name])
-        labels = np.array(all_labels[name])
-        mae    = float(np.mean(np.abs(preds - labels))) if len(preds) else float("nan")
-        results[name] = {"mae": mae, "preds": preds, "labels": labels}
-    return results
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Training and evaluation
@@ -618,9 +566,13 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler_amp, device, cli
     float — mean training loss for the epoch
     """
     model.train()
+    model.backbone.eval()
+    for name, module in model.backbone.named_modules():
+        if "lora_dropout" in name:
+            module.train()
     losses = []
 
-    for gene_ids, masked_vals, _, _, ages_norm in loader:
+    for gene_ids, masked_vals, _, _, ages_norm, _ in loader:
         gene_ids    = gene_ids.to(device)
         masked_vals = masked_vals.to(device)
         ages_norm   = ages_norm.to(device).squeeze()
@@ -632,7 +584,7 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler_amp, device, cli
         optimizer.zero_grad()
         scaler_amp.scale(loss).backward()
         scaler_amp.unscale_(optimizer)
-        #torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
         scaler_amp.step(optimizer)
         scaler_amp.update()
 
@@ -677,3 +629,104 @@ def evaluate(model, loader, scaler, device):
     preds  = np.array(preds)
     labels = np.array(labels)
     return float(np.mean(np.abs(preds - labels))), preds, labels, sample_ids
+
+def train_one_epoch_multiclock(model, loader, optimizer, scaler_amp, device, clock_names, clip_grad=1.0):
+    """
+    One epoch of joint multi-clock head training.
+
+    A single backbone forward pass per batch (model.encode) feeds every
+    clock head; per-clock MSE is masked to only the samples that actually
+    have a label for that clock, then summed into one loss for one backward
+    pass covering all heads simultaneously.
+
+    Returns
+    -------
+    dict[str, float] — mean training loss per clock this epoch
+    """
+    model.train()
+    model.backbone.eval()  # backbone frozen: keep its dropout/BN off regardless of .train()
+
+    per_clock_losses = {name: [] for name in clock_names}
+
+    for gene_ids, masked_vals, _, ages, valid, ages_norm, *_ in loader:
+        gene_ids    = gene_ids.to(device)
+        masked_vals = masked_vals.to(device)
+
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            preds = model(gene_ids, masked_vals, clock_names=clock_names)
+
+            total_loss = 0.0
+            batch_losses = {}
+            for name in clock_names:
+                v = valid[name].to(device)
+                if v.sum() == 0:
+                    continue  # no labeled samples for this clock in this batch
+                target = ages_norm[name].to(device)[v]
+                pred   = preds[name][v]
+                loss   = nn.functional.mse_loss(pred, target)
+                total_loss = total_loss + loss
+                batch_losses[name] = loss.item()
+
+        if isinstance(total_loss, torch.Tensor):
+            scaler_amp.scale(total_loss).backward()
+            scaler_amp.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            scaler_amp.step(optimizer)
+            scaler_amp.update()
+
+        for name, l in batch_losses.items():
+            per_clock_losses[name].append(l)
+
+    return {
+        name: float(np.mean(losses)) if losses else float("nan")
+        for name, losses in per_clock_losses.items()
+    }
+
+
+@torch.no_grad()
+def evaluate_multiclock(model, loader, scalers, device, clock_names):
+    """
+    Run inference for every clock head, return per-clock MAE + predictions.
+
+    Returns
+    -------
+    dict[str, dict] — keyed by clock name, each value has
+        {"mae": float, "preds": np.ndarray, "labels": np.ndarray}
+    (preds/labels only include samples that actually had a label for that
+    clock; clocks with zero labeled samples in this loader return NaN mae
+    and empty arrays.)
+    """
+    model.eval()
+
+    all_preds  = {name: [] for name in clock_names}
+    all_labels = {name: [] for name in clock_names}
+    all_ids    = {name: [] for name in clock_names}
+
+    for gene_ids, _, target_vals, ages, valid, _, ids in loader:
+        gene_ids    = gene_ids.to(device)
+        target_vals = target_vals.to(device)
+
+        with torch.cuda.amp.autocast():
+            preds = model(gene_ids, target_vals, clock_names=clock_names)
+
+        for name in clock_names:
+            v = valid[name].numpy()
+            if v.sum() == 0:
+                continue
+            pred_norm = preds[name].float().cpu().numpy()[v]
+            pred_age  = scalers[name].inverse_transform(
+                pred_norm.reshape(-1, 1)
+            ).flatten()
+            all_preds[name].extend(pred_age)
+            all_labels[name].extend(ages[name].numpy()[v])
+            all_ids[name].extend(np.asarray(ids)[v])
+
+    results = {}
+    for name in clock_names:
+        preds  = np.array(all_preds[name])
+        labels = np.array(all_labels[name])
+        ids    = np.array(all_ids[name])
+        mae    = float(np.mean(np.abs(preds - labels))) if len(preds) else float("nan")
+        results[name] = {"mae": mae, "preds": preds, "labels": labels , 'ids' : ids}
+    return results

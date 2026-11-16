@@ -48,7 +48,7 @@
 #SBATCH --cpus-per-task=10
 
 # Maximum time for the job to run, format: days-hours:minutes:seconds
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 
 # Partition of the cluster to pick nodes from (check `sinfo`)
 #SBATCH --partition=h100

@@ -38,7 +38,6 @@ from epihydra import AgePredictor, MultiClockPredictor, load_backbone
 
 DEFAULT_CLOCK = "age"
 CKPT_NAME     = "best_model.pt"
-SCALER_FILE   = "scalers.pkl"
 LORA_TARGETS  = ["Wqkv", "out_proj", "linear1", "linear2"]
 PAD_VALUE     = -2.0   # missing CpG / padding value used in tokenisation
 MASK_VALUE    = -1.0   # mask token value used in training
@@ -84,7 +83,7 @@ def resolve_clocks(clocks, head_path):
     return list(dict.fromkeys([DEFAULT_CLOCK, *clocks]))
 
 
-def load_scalers(head_path, clock=None, scaler_file=SCALER_FILE):
+def load_scalers(head_path, epihydra_path=None, clock=None):
     """
     Load label scalers saved by a training run (`head_path/scalers.pkl`).
  
@@ -94,13 +93,20 @@ def load_scalers(head_path, clock=None, scaler_file=SCALER_FILE):
     Returns None where nothing is saved, in which case build_dataloaders /
     build_multiclock_dataloaders fit a fresh scaler on the training split.
     """
-    path = Path(head_path) / scaler_file
+    path = Path(head_path) / 'scalers.pkl'
     if not path.exists():
         print(f"ℹ  No scaler file at {path}; scalers will be fitted.")
         return None
  
     with open(path, "rb") as f:
         scalers = pickle.load(f)
+
+    if epihydra_path is not None : 
+        epihydra_path = Path(epihydra_path) / 'scaler.pkl'
+        with open(epihydra_path, "rb") as f:
+            age_scaler = pickle.load(f)
+    
+        scalers['age'] = age_scaler
  
     if clock is None:
         return scalers
@@ -158,10 +164,20 @@ def load_clock_state(ckpt, head_path, clock=DEFAULT_CLOCK, device="cpu"):
 # 3. Model construction
 # ═════════════════════════════════════════════════════════════════════════════
 
-def default_lora_config(r=16, alpha=8, dropout=0.1):
+def default_lora_config(r, alpha, dropout=0.1):
     """LoRA config used at training time. Must match to load checkpoints."""
     return LoraConfig(r=r, lora_alpha=alpha, target_modules=LORA_TARGETS,
                       lora_dropout=dropout)
+
+def lora_config_from_ckpt(ckpt, dropout=0.1):
+    """LoRA config exactly as used in training, read from best_model.pt's run_config."""
+    raw = torch.load(_ckpt_file(ckpt), map_location="cpu")
+    rc  = raw.get("run_config", {}) or {}
+    if "lora_r" not in rc or "lora_alpha" not in rc:
+        raise KeyError(f"{_ckpt_file(ckpt)} has no lora_r / lora_alpha in run_config; "
+                       f"pass lora_config explicitly.")
+    print(f"LoRA from checkpoint: r={rc['lora_r']}, alpha={rc['lora_alpha']}")
+    return default_lora_config(r=int(rc["lora_r"]), alpha=int(rc["lora_alpha"]), dropout=dropout)
 
 
 def _build_backbone(model_path, vocab, pretrain_config, device, lora_config=None):
@@ -174,17 +190,18 @@ def _build_backbone(model_path, vocab, pretrain_config, device, lora_config=None
 
 
 def build_age_model(model_path, vocab, pretrain_config, device, *,
-                    ckpt=None, head_path=None, clock=DEFAULT_CLOCK,
-                    num_heads=4, dropout=0.1, lora_config=None):
+                    ckpt, head_path=None, clock=DEFAULT_CLOCK,
+                    num_heads=4, dropout=0.1):
     """
-    Single-clock AgePredictor with a LoRA-wrapped backbone.
+    Trained single-clock AgePredictor for inference.
 
-    ckpt=None  : fresh model, ready for training.
-    ckpt given : trained weights for `clock` are loaded (head swapped in from
-                 head_path when clock != 'age') and the model is put in eval mode.
+    LoRA r/alpha are read from `ckpt` (best_model.pt or its folder); the head for
+    `clock` is swapped in from head_path when clock != 'age'. Returns the model in
+    eval mode.
     """
-    backbone = _build_backbone(model_path, vocab, pretrain_config, device,
-                               lora_config or default_lora_config())
+    lora_config = lora_config_from_ckpt(ckpt)
+    backbone    = _build_backbone(model_path, vocab, pretrain_config, device, lora_config)
+
     model = AgePredictor(
         backbone,
         embed_dim = pretrain_config["layer_size"],
@@ -193,30 +210,32 @@ def build_age_model(model_path, vocab, pretrain_config, device, *,
         dropout   = dropout,
     ).to(device)
 
-    if ckpt is not None:
-        model.load_state_dict(load_clock_state(ckpt, head_path, clock, device))
-        model.eval()
+    model.load_state_dict(load_clock_state(ckpt, head_path, clock, device))
+    model.eval()
     return model
 
 
-def build_multiclock_model(model_path, vocab, pretrain_config, lora_ckpt, head_path,
-                           clock_names, device, *, num_heads=4, dropout=0.1,
-                           lora_r=16, lora_alpha=8):
+def build_multiclock_model(model_path, vocab, pretrain_config, device, *,
+                           ckpt, head_path, clock_names,
+                           num_heads=4, dropout=0.1):
     """
-    MultiClockPredictor for inference: LoRA adapters from best_model.pt merged
-    into a frozen backbone, plus one trained head per clock.
+    Trained MultiClockPredictor for inference.
 
-    lora_ckpt : best_model.pt or the folder containing it
-    head_path : folder with best_head_<clock>.pt files
+    LoRA adapters from `ckpt` (best_model.pt or its folder; r/alpha read from its
+    run_config) are merged into a frozen backbone, plus one trained head per clock
+    from head_path (best_head_<clock>.pt). Returns the model in eval mode.
     """
     from epihydra.run_multiclock import load_lora_adapters
 
-    lora_ckpt = _ckpt_file(lora_ckpt)
+    ckpt        = _ckpt_file(ckpt)
+    lora_config = lora_config_from_ckpt(ckpt)
 
     # ── Backbone: load, merge LoRA, freeze ──────────────────────────────────
     backbone = _build_backbone(model_path, vocab, pretrain_config, device)
-    backbone, _ = load_lora_adapters(backbone, lora_ckpt, device,
-                                     lora_r=lora_r, lora_alpha=lora_alpha, merge=True)
+    backbone, _ = load_lora_adapters(backbone, ckpt, device,
+                                     lora_r=lora_config.r,
+                                     lora_alpha=lora_config.lora_alpha,
+                                     merge=True)
     backbone.requires_grad_(False)
     backbone.eval()
 
@@ -231,18 +250,17 @@ def build_multiclock_model(model_path, vocab, pretrain_config, lora_ckpt, head_p
 
     # ── Heads ────────────────────────────────────────────────────────────────
     for name in clock_names:
-        head_state, meta = load_head_weights(name, lora_ckpt, head_path)
+        head_state, meta = load_head_weights(name, ckpt, head_path)
         model.heads[name].load_state_dict(head_state)
 
         trained_on = ((meta or {}).get("lora") or {}).get("ckpt")
-        if trained_on and _ckpt_file(trained_on).resolve() != lora_ckpt.resolve():
-            print(f"  ⚠  head '{name}' was trained on backbone {trained_on}, not {lora_ckpt}")
-        src = lora_ckpt.name if meta is None else f"best_head_{name}.pt (epoch {meta.get('epoch')})"
+        if trained_on and _ckpt_file(trained_on).resolve() != ckpt.resolve():
+            print(f"  ⚠  head '{name}' was trained on backbone {trained_on}, not {ckpt}")
+        src = ckpt.name if meta is None else f"best_head_{name}.pt (epoch {meta.get('epoch')})"
         print(f"  loaded head {name:<20} <- {src}")
 
     model.eval()
     return model
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 4. Inference
@@ -289,7 +307,7 @@ def _apply_masking(gene_ids, values, pad_id, frac=0.0, remove_ids=None):
 
 @torch.no_grad()
 def predict_multiclock(model, loader, scalers, device, clock_names,
-                       sample_ids=None, mask_frac=0.0, remove_ids=None, seed=None):
+                        mask_frac=0.0, remove_ids=None, seed=None):
     """
     One backbone forward pass per batch, fanned out to every clock head.
 
@@ -316,7 +334,9 @@ def predict_multiclock(model, loader, scalers, device, clock_names,
     preds  = {n: [] for n in clock_names}
     truths = {n: [] for n in clock_names}
 
-    for gene_ids, _, target_vals, ages, _, _ in loader:
+    batch_ids = []
+    for gene_ids, _, target_vals, ages, _, _, ids in loader:
+        batch_ids.extend(ids)
         gene_ids = gene_ids.to(device)
         values   = _apply_masking(gene_ids, target_vals.to(device), model.pad_id,
                                   frac=mask_frac, remove_ids=remove_ids)
@@ -330,17 +350,12 @@ def predict_multiclock(model, loader, scalers, device, clock_names,
             truths[name].append(ages[name].numpy())
 
     n = sum(len(b) for b in preds[clock_names[0]])
-    if sample_ids is None:
-        sample_ids = range(n)
-    elif n != len(sample_ids):
-        raise ValueError(f"Got {n} predictions for {len(sample_ids)} sample IDs; "
-                         f"is the loader shuffled?")
 
     columns = {}
     for name in clock_names:
         columns[f"{name}_pred"] = np.concatenate(preds[name])
         columns[f"{name}_true"] = np.concatenate(truths[name])
-    return pd.DataFrame(columns, index=pd.Index(list(sample_ids), name="ID"))
+    return pd.DataFrame(columns, index=pd.Index(batch_ids, name="ID"))
 
 
 # ═════════════════════════════════════════════════════════════════════════════

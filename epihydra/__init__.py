@@ -11,6 +11,10 @@ from .epihydra import (
     AgePredictor,
     MultiClockPredictor,
     load_backbone,
+    precompute_cpg_ranks, 
+    DEFAULT_MASK_WEIGHTS,
+    LinearProbeHead,
+    init_head_from_ridge,
 )
 
 from .train import (
