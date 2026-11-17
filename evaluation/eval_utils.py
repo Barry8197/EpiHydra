@@ -307,19 +307,20 @@ def _apply_masking(gene_ids, values, pad_id, frac=0.0, remove_ids=None):
 
 @torch.no_grad()
 def predict_multiclock(model, loader, scalers, device, clock_names,
-                        mask_frac=0.0, remove_ids=None, seed=None):
+                        mask_frac=0.0, remove_ids=None, seed=None, impute_ref=None):
     """
     One backbone forward pass per batch, fanned out to every clock head.
-
-    Every sample is kept (labels are NaN where a clock is unlabelled), so the
-    result can feed any metric/plot below.
 
     Parameters
     ----------
     loader     : unshuffled DataLoader (see ordered_loader)
-    sample_ids : row labels, e.g. splits['test_df'].index; defaults to 0..n-1
     mask_frac  : extra fraction of observed CpGs to mask (missing-feature tests)
     seed       : torch seed for the extra masking, so fractions are comparable
+    impute_ref : optional tensor from reference_by_token(). If given, every missing
+                 CpG (masked -1 or originally missing -2) is replaced by its
+                 reference beta before the forward pass, i.e. the same per-CpG
+                 imputation the linear clocks receive. CpGs without a reference
+                 value stay missing.
 
     Returns
     -------
@@ -341,6 +342,12 @@ def predict_multiclock(model, loader, scalers, device, clock_names,
         values   = _apply_masking(gene_ids, target_vals.to(device), model.pad_id,
                                   frac=mask_frac, remove_ids=remove_ids)
 
+        if impute_ref is not None:
+            fill    = impute_ref[gene_ids]                       # reference beta per position
+            missing = values.lt(0) & gene_ids.ne(model.pad_id)   # masked (-1) or missing (-2)
+            missing[:, 0] = False                                # never touch <cls>
+            values  = torch.where(missing & ~torch.isnan(fill), fill, values)
+
         with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
             out = model(gene_ids, values, clock_names=clock_names)
 
@@ -348,8 +355,6 @@ def predict_multiclock(model, loader, scalers, device, clock_names,
             p = out[name].float().cpu().numpy().reshape(-1, 1)
             preds[name].append(scalers[name].inverse_transform(p).ravel())
             truths[name].append(ages[name].numpy())
-
-    n = sum(len(b) for b in preds[clock_names[0]])
 
     columns = {}
     for name in clock_names:
@@ -441,26 +446,107 @@ def pairwise_metrics(predictions, clock_names, rows="pred", cols="true", min_sam
 
 
 def evaluate_missing_fraction(model, loader, scalers, device, clock_names,
-                              mask_fractions, seed=42, min_samples=2):
+                              mask_fractions, seed=42, min_samples=2,
+                              impute_ref=None):
     """
     Per-clock performance as an increasing fraction of observed CpGs is masked.
     The same seed is reused at every fraction so results are comparable.
 
+    impute_ref : optional tensor from reference_by_token(). If given, every
+                 missing CpG (masked or originally missing) is replaced by its
+                 per-CpG reference beta before prediction -- the same imputation
+                 the linear clocks receive. Use the same seed with and without
+                 it so both runs hide the same CpGs.
+
     Returns
     -------
-    Long DataFrame [clock, mask_frac, n, mae, pearson_r, r2]
+    Long DataFrame [clock, mask_frac, imputed, n, mae, pearson_r, r2]
     """
     frames = [
         metrics_by_clock(
             predict_multiclock(model, loader, scalers, device, clock_names,
-                               mask_frac=frac, seed=seed),
-            clock_names, min_samples, mask_frac=frac,
+                               mask_frac=frac, seed=seed, impute_ref=impute_ref),
+            clock_names, min_samples,
+            mask_frac=frac, imputed=impute_ref is not None,
         )
         for frac in mask_fractions
     ]
     return pd.concat(frames, ignore_index=True)
 
 
+def evaluate_systematic_removal(model, loader, scalers, device, clock_names,
+                                ranked_indices, removal_fractions, min_samples=2,
+                                impute_ref=None):
+    """
+    Remove the same CpG probes from EVERY sample, simulating an assay or
+    genomic-region failure, in the order given by `ranked_indices`.
+
+    Parameters
+    ----------
+    ranked_indices    : positions in the vocab-aligned CpG array (the 'data'
+                        column), in removal order; index 0 is removed first.
+                        From rank_cpgs().
+    removal_fractions : fractions of len(ranked_indices) to remove,
+                        e.g. [0.0, 0.1, ..., 0.9]
+    impute_ref        : optional tensor from reference_by_token(). If given,
+                        removed and originally missing CpGs are replaced by
+                        their per-CpG reference beta before prediction.
+
+    Returns
+    -------
+    Long DataFrame [clock, removal_frac, n_removed, total_missing, imputed,
+                    n, mae, pearson_r, r2]
+    total_missing is the mean fraction of vocab CpGs whose measured value the
+    model did not get (real missingness + removed probes), comparable with
+    evaluate_missing_fraction. With impute_ref those CpGs carry reference
+    values instead, but they are still counted as missing measurements.
+    """
+    ranked_indices = np.asarray(ranked_indices)
+    cpg_ids        = loader.dataset.vocab.CpG_ids             # array position → token ID
+    missing        = np.stack([~np.isfinite(x) for x in loader.dataset.gene_datas])
+    n_vocab        = missing.shape[1]
+    base_missing   = missing.sum(axis=1)
+
+    frames = []
+    for frac in removal_fractions:
+        n_remove = int(frac * len(ranked_indices))
+        removed  = ranked_indices[:n_remove]
+
+        # Removed probes that were already missing don't add to the total
+        hidden = base_missing + n_remove - missing[:, removed].sum(axis=1)
+
+        preds = predict_multiclock(
+            model, loader, scalers, device, clock_names,
+            remove_ids=cpg_ids[removed] if n_remove else None,
+            impute_ref=impute_ref,
+        )
+        frames.append(metrics_by_clock(
+            preds, clock_names, min_samples,
+            removal_frac=frac, n_removed=n_remove,
+            total_missing=float((hidden / n_vocab).mean()),
+            imputed=impute_ref is not None,
+        ))
+    return pd.concat(frames, ignore_index=True)
+
+
+def reference_by_token(reference, vocab, device):
+    """
+    Tensor indexed by token ID holding each CpG's reference beta
+    (NaN where a CpG has no reference value).
+
+    reference : pd.Series indexed by CpG name, e.g. from build_cpg_reference
+    vocab     : VocabWrapper
+    """
+    ref    = torch.full((len(vocab.vocab),), float("nan"), dtype=torch.float32)
+    known  = reference.dropna()
+    names  = [c for c in known.index if c in vocab.vocab]
+    if names:
+        ids = torch.as_tensor(vocab.vocab.lookup_indices(names), dtype=torch.long)
+        ref[ids] = torch.as_tensor(known.loc[names].to_numpy(), dtype=torch.float32)
+    print(f"Reference values for {len(names):,} of {len(vocab.CpG_list):,} vocab CpGs")
+    return ref.to(device)
+    
+    
 def compute_sample_coverage(df):
     """
     Fraction of vocab CpGs actually observed for each sample.
@@ -546,54 +632,6 @@ def rank_cpgs(df, strategy="low_variance"):
         ranked = np.argsort(stat)[::-1]    # descending: highest mean first
 
     return ranked.astype(int), strategy_labels[strategy]
-
-
-def evaluate_systematic_removal(model, loader, scalers, device, clock_names,
-                                ranked_indices, removal_fractions, min_samples=2):
-    """
-    Remove the same CpG probes from EVERY sample, simulating an assay or
-    genomic-region failure, in the order given by `ranked_indices`.
-
-    Parameters
-    ----------
-    ranked_indices    : positions in the vocab-aligned CpG array (the 'data'
-                        column), in removal order; index 0 is removed first.
-                        From rank_cpgs().
-    removal_fractions : fractions of len(ranked_indices) to remove,
-                        e.g. [0.0, 0.1, ..., 0.9]
-
-    Returns
-    -------
-    Long DataFrame [clock, removal_frac, n_removed, total_missing,
-                    n, mae, pearson_r, r2]
-    total_missing is the mean fraction of vocab CpGs the model did not see
-    (real missingness + removed probes), comparable with
-    evaluate_missing_fraction.
-    """
-    ranked_indices = np.asarray(ranked_indices)
-    cpg_ids        = loader.dataset.vocab.CpG_ids             # array position → token ID
-    missing        = np.stack([~np.isfinite(x) for x in loader.dataset.gene_datas])
-    n_vocab        = missing.shape[1]
-    base_missing   = missing.sum(axis=1)
-
-    frames = []
-    for frac in removal_fractions:
-        n_remove = int(frac * len(ranked_indices))
-        removed  = ranked_indices[:n_remove]
-
-        # Removed probes that were already missing don't add to the total
-        hidden = base_missing + n_remove - missing[:, removed].sum(axis=1)
-
-        preds = predict_multiclock(
-            model, loader, scalers, device, clock_names,
-            remove_ids=cpg_ids[removed] if n_remove else None,
-        )
-        frames.append(metrics_by_clock(
-            preds, clock_names, min_samples,
-            removal_frac=frac, n_removed=n_remove,
-            total_missing=float((hidden / n_vocab).mean()),
-        ))
-    return pd.concat(frames, ignore_index=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. Plotting
